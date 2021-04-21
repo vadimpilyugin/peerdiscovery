@@ -1,4 +1,4 @@
-module github.com/schollz/peerdiscovery
+module github.com/vadimpilyugin/peerdiscovery
 
 go 1.13
 
