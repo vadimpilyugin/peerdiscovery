@@ -87,8 +87,6 @@ type peerDiscovery struct {
 // See the Settings for more information.
 func initialize(settings Settings) (p *peerDiscovery, err error) {
 	p = new(peerDiscovery)
-	p.Lock()
-	defer p.Unlock()
 
 	// initialize settings
 	p.settings = settings
@@ -113,9 +111,10 @@ func initialize(settings Settings) (p *peerDiscovery, err error) {
 	if p.settings.Delay == 0 {
 		p.settings.Delay = 1 * time.Second
 	}
-	if p.settings.TimeLimit == 0 {
-		p.settings.TimeLimit = 10 * time.Second
-	}
+	// no time limit set means broadcast forever
+	// if p.settings.TimeLimit == 0 {
+	// 	p.settings.TimeLimit = 10 * time.Second
+	// }
 	if p.settings.StopChan == nil {
 		p.settings.StopChan = make(chan struct{})
 	}
@@ -141,10 +140,7 @@ type NetPacketConn interface {
 	WriteTo(buf []byte, dst net.Addr) (int, error)
 }
 
-// Discover will use the created settings to scan for LAN peers. It will return
-// an array of the discovered peers and their associate payloads. It will not
-// return broadcasts sent to itself.
-func Discover(settings ...Settings) (discoveries []Discovered, err error) {
+func Publisher(settings ...Settings) (err error) {
 	s := Settings{}
 	if len(settings) > 0 {
 		s = settings[0]
@@ -154,13 +150,11 @@ func Discover(settings ...Settings) (discoveries []Discovered, err error) {
 		return
 	}
 
-	p.RLock()
 	address := net.JoinHostPort(p.settings.MulticastAddress, p.settings.Port)
 	portNum := p.settings.portNum
 
 	tickerDuration := p.settings.Delay
 	timeLimit := p.settings.TimeLimit
-	p.RUnlock()
 
 	// get interfaces
 	ifaces, err := net.Interfaces()
@@ -189,7 +183,6 @@ func Discover(settings ...Settings) (discoveries []Discovered, err error) {
 		p2.JoinGroup(&ifaces[i], &net.UDPAddr{IP: group, Port: portNum})
 	}
 
-	go p.listen()
 	ticker := time.NewTicker(tickerDuration)
 	defer ticker.Stop()
 	start := time.Now()
@@ -197,20 +190,16 @@ func Discover(settings ...Settings) (discoveries []Discovered, err error) {
 	for {
 		exit := false
 
-		p.RLock()
 		if len(p.received) >= p.settings.Limit && p.settings.Limit > 0 {
 			exit = true
 		}
-		p.RUnlock()
 
-		if !s.DisableBroadcast {
-			payload := p.settings.Payload
-			if p.settings.PayloadFunc != nil {
-				payload = p.settings.PayloadFunc()
-			}
-			// write to multicast
-			broadcast(p2, payload, ifaces, &net.UDPAddr{IP: group, Port: portNum})
+		payload := p.settings.Payload
+		if p.settings.PayloadFunc != nil {
+			payload = p.settings.PayloadFunc()
 		}
+		// write to multicast
+		broadcast(p2, payload, ifaces, &net.UDPAddr{IP: group, Port: portNum})
 
 		select {
 		case <-p.settings.StopChan:
@@ -222,56 +211,23 @@ func Discover(settings ...Settings) (discoveries []Discovered, err error) {
 			break
 		}
 	}
-
-	if !s.DisableBroadcast {
-		payload := p.settings.Payload
-		if p.settings.PayloadFunc != nil {
-			payload = p.settings.PayloadFunc()
-		}
-		// send out broadcast that is finished
-		broadcast(p2, payload, ifaces, &net.UDPAddr{IP: group, Port: portNum})
-	}
-
-	p.RLock()
-	discoveries = make([]Discovered, len(p.received))
-	i := 0
-	for ip, payload := range p.received {
-		discoveries[i] = Discovered{
-			Address: ip,
-			Payload: payload,
-		}
-		i++
-	}
-	p.RUnlock()
 	return
 }
 
-func broadcast(p2 NetPacketConn, payload []byte, ifaces []net.Interface, dst net.Addr) {
-	for i := range ifaces {
-		if errMulticast := p2.SetMulticastInterface(&ifaces[i]); errMulticast != nil {
-			continue
-		}
-		p2.SetMulticastTTL(2)
-		if _, errMulticast := p2.WriteTo([]byte(payload), dst); errMulticast != nil {
-			continue
-		}
+func Subscriber(settings ...Settings) (discoveries []Discovered, err error) {
+	s := Settings{}
+	if len(settings) > 0 {
+		s = settings[0]
 	}
-}
+	p, err := initialize(s)
+	if err != nil {
+		return
+	}
 
-const (
-	// https://en.wikipedia.org/wiki/User_Datagram_Protocol#Packet_structure
-	maxDatagramSize = 66507
-)
-
-// Listen binds to the UDP address and port given and writes packets received
-// from that address to a buffer which is passed to a hander
-func (p *peerDiscovery) listen() (recievedBytes []byte, err error) {
-	p.RLock()
 	address := net.JoinHostPort(p.settings.MulticastAddress, p.settings.Port)
 	portNum := p.settings.portNum
 	allowSelf := p.settings.AllowSelf
 	notify := p.settings.Notify
-	p.RUnlock()
 	localIPs := getLocalIPs()
 
 	// get interfaces
@@ -301,8 +257,10 @@ func (p *peerDiscovery) listen() (recievedBytes []byte, err error) {
 	}
 
 	// Loop forever reading from the socket
+	buffer := make([]byte, maxDatagramSize)
+	start := time.Now()
+	timeLimit := p.settings.TimeLimit
 	for {
-		buffer := make([]byte, maxDatagramSize)
 		var (
 			n       int
 			src     net.Addr
@@ -322,11 +280,9 @@ func (p *peerDiscovery) listen() (recievedBytes []byte, err error) {
 
 		// log.Println(src, hex.Dump(buffer[:n]))
 
-		p.Lock()
 		if _, ok := p.received[srcHost]; !ok {
 			p.received[srcHost] = buffer[:n]
 		}
-		p.Unlock()
 
 		if notify != nil {
 			notify(Discovered{
@@ -335,16 +291,40 @@ func (p *peerDiscovery) listen() (recievedBytes []byte, err error) {
 			})
 		}
 
-		p.RLock()
-		if len(p.received) >= p.settings.Limit && p.settings.Limit > 0 {
-			p.RUnlock()
+		if timeLimit > 0 && time.Since(start) > timeLimit || len(p.received) >= p.settings.Limit && p.settings.Limit > 0 {
 			break
 		}
-		p.RUnlock()
+	}
+
+	discoveries = make([]Discovered, len(p.received))
+	i := 0
+	for ip, payload := range p.received {
+		discoveries[i] = Discovered{
+			Address: ip,
+			Payload: payload,
+		}
+		i++
 	}
 
 	return
 }
+
+func broadcast(p2 NetPacketConn, payload []byte, ifaces []net.Interface, dst net.Addr) {
+	for i := range ifaces {
+		if errMulticast := p2.SetMulticastInterface(&ifaces[i]); errMulticast != nil {
+			continue
+		}
+		p2.SetMulticastTTL(2)
+		if _, errMulticast := p2.WriteTo([]byte(payload), dst); errMulticast != nil {
+			continue
+		}
+	}
+}
+
+const (
+	// https://en.wikipedia.org/wiki/User_Datagram_Protocol#Packet_structure
+	maxDatagramSize = 66507
+)
 
 // getLocalIPs returns the local ip address
 func getLocalIPs() (ips map[string]struct{}) {
